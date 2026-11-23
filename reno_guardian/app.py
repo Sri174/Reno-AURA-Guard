@@ -90,10 +90,11 @@ async def call_owner(store, incident):
         SubElement(connect, "ConversationRelay", {
             "url": f"{url}/voice/{ident}?expires={expires}&token={token}",
             "language": "ta-IN", "ttsProvider": "Google", "transcriptionProvider": "Google",
-            "speechModel": "long", "voice": env("TAMIL_VOICE", "ta-IN-Chirp3-HD-Aoede"),
+            "speechModel": env("SPEECH_MODEL", "short"), "voice": env("TAMIL_VOICE", "ta-IN-Chirp3-HD-Aoede"),
             "interruptible": "any",
             "reportInputDuringAgentSpeech": "any", "speechTimeout": "1200",
             "transcriptionLanguage": "ta-IN", "ttsLanguage": "ta-IN",
+            "dtmfDetection": "true", "events": "speaker-events",
             "welcomeGreeting": "ஹலோ, நான் Reno Guardian, உங்க AI assistant. இப்போ பேசலாமா?"
         })
         async with httpx.AsyncClient(timeout=15) as client:
@@ -296,6 +297,16 @@ async def voice(ws: WebSocket, ident: int):
     try:
         async with asyncio.timeout(300):
             async for message in ws.iter_json():
+                if message.get("type") == "info":
+                    name = message.get("name")
+                    if name in ("agentSpeaking", "clientSpeaking"):
+                        trace(name)
+                if message.get("type") == "dtmf":
+                    trace("keypad_received")
+                    if message.get("digit") == "1":
+                        await ws.send_json({"type": "text", "token": "நீங்க அழுத்தின பட்டன் signal வந்திருக்கு. இப்போ ஹலோ, தமிழ்ல பேசலாமான்னு சொல்லுங்க.",
+                                            "last": True, "interruptible": True})
+                        trace("keypad_reply_sent")
                 if message.get("type") in ("setup", "error", "interrupt"):
                     trace(message["type"])
                     log.info("Guardian voice event incident=%s type=%s", ident, message["type"])

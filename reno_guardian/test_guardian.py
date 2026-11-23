@@ -144,6 +144,7 @@ class GuardianTests(unittest.TestCase):
         self.assertEqual(relay.attrib["reportInputDuringAgentSpeech"], "any")
         self.assertEqual(relay.attrib["transcriptionLanguage"], "ta-IN")
         self.assertEqual(relay.attrib["speechTimeout"], "1200")
+        self.assertEqual(relay.attrib["dtmfDetection"], "true")
 
     def test_empty_speech_and_late_interrupt_do_not_cancel_reply(self):
         import asyncio
@@ -189,6 +190,20 @@ class GuardianTests(unittest.TestCase):
                     self.assertTrue(notice["preemptible"])
                     self.assertIn("நேரம்", notice["token"])
                     self.assertEqual(socket.receive_json()["token"], "சரி, பேசலாம்.")
+
+    def test_keypad_checks_reply_path_without_ai(self):
+        settings = {"GUARDIAN_ADMIN_TOKEN": "x"*40, "GUARDIAN_HEALTH_URL": "",
+                    "GUARDIAN_CALLS_ENABLED": "false", "GUARDIAN_STATE_PATH": self.temp.name+"/keypad.sqlite3"}
+        with patch.dict(os.environ, settings), patch("reno_guardian.app.answer", new=AsyncMock()) as ai:
+            with TestClient(app) as client:
+                ident = app.state.store.event("keypad", "Test", "Synthetic", "info")["id"]
+                expires = int(time.time())+300
+                with client.websocket_connect(f"/voice/{ident}?expires={expires}&token={voice_token(ident, expires)}") as socket:
+                    socket.send_json({"type": "dtmf", "digit": "1"})
+                    reply = socket.receive_json()
+                    self.assertIn("signal", reply["token"])
+                    self.assertTrue(reply["last"])
+                    ai.assert_not_awaited()
 
 
 if __name__ == "__main__":
