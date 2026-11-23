@@ -124,6 +124,27 @@ class GuardianTests(unittest.TestCase):
             self.assertEqual(self.store.incidents()[0]["state"], "resolved")
         asyncio.run(scenario())
 
+    def test_call_reports_speech_during_greeting(self):
+        import asyncio
+        import httpx
+        from xml.etree.ElementTree import fromstring
+        from .app import call_owner
+        client = AsyncMock()
+        client.post.return_value = httpx.Response(201, json={"sid": "test-call"},
+            request=httpx.Request("POST", "https://api.twilio.com"))
+        context = AsyncMock()
+        context.__aenter__.return_value = client
+        settings = {"GUARDIAN_CALLS_ENABLED": "true", "GUARDIAN_ADMIN_TOKEN": "x"*40,
+                    "GUARDIAN_PUBLIC_URL": "https://example.test", "GUARDIAN_TWILIO_SID": "test",
+                    "GUARDIAN_TWILIO_TOKEN": "test", "GUARDIAN_PHONE_FROM": "+15005550006",
+                    "GUARDIAN_PHONE_TO": "+15005550009"}
+        with patch.dict(os.environ, settings), patch("reno_guardian.app.httpx.AsyncClient", return_value=context):
+            asyncio.run(call_owner(self.store, self.incident()))
+        relay = fromstring(client.post.call_args.kwargs["data"]["Twiml"]).find("Connect/ConversationRelay")
+        self.assertEqual(relay.attrib["reportInputDuringAgentSpeech"], "any")
+        self.assertEqual(relay.attrib["transcriptionLanguage"], "ta-IN")
+        self.assertEqual(relay.attrib["speechTimeout"], "1200")
+
 
 if __name__ == "__main__":
     unittest.main()

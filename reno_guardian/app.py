@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager, suppress
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
@@ -16,6 +17,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .core import Store, redact
+
+log = logging.getLogger("uvicorn.error")
 
 
 def env(name, default=""):
@@ -89,6 +92,8 @@ async def call_owner(store, incident):
             "language": "ta-IN", "ttsProvider": "Google", "transcriptionProvider": "Google",
             "speechModel": "long", "voice": env("TAMIL_VOICE", "ta-IN-Chirp3-HD-Aoede"),
             "interruptible": "any",
+            "reportInputDuringAgentSpeech": "any", "speechTimeout": "1200",
+            "transcriptionLanguage": "ta-IN", "ttsLanguage": "ta-IN",
             "welcomeGreeting": "ஹலோ, நான் Reno Guardian, உங்க AI assistant. இப்போ பேசலாமா?"
         })
         async with httpx.AsyncClient(timeout=15) as client:
@@ -234,23 +239,33 @@ async def voice(ws: WebSocket, ident: int):
         return
     app.state.used_voice.add(token)
     await ws.accept()
+    log.info("Guardian voice connected incident=%s", ident)
     history = []
     task = None
     pending_speech = []
 
     async def respond(question):
+        started = time.monotonic()
+        log.info("Guardian voice final prompt incident=%s chars=%s", ident, len(question))
         history.append({"role": "user", "content": redact(question)[:2000]})
         try:
             reply = await answer(incident, history)
-        except (httpx.HTTPError, KeyError, ValueError):
+        except (httpx.HTTPError, KeyError, ValueError, TypeError, IndexError) as exc:
+            log.warning("Guardian voice AI failed incident=%s error_type=%s", ident, type(exc).__name__)
             reply = "சாரி, இப்போ AI service-ல இருந்து பதில் வரல. Dashboard-ல இந்த alert விவரங்களைப் பாருங்க."
         await ws.send_json({"type": "text", "token": reply, "last": True, "interruptible": True})
+        log.info("Guardian voice reply sent incident=%s elapsed_ms=%s", ident, round((time.monotonic()-started)*1000))
         history.append({"role": "assistant", "content": reply})
         del history[:-12]
 
     try:
         async with asyncio.timeout(300):
             async for message in ws.iter_json():
+                if message.get("type") in ("setup", "error", "interrupt"):
+                    log.info("Guardian voice event incident=%s type=%s", ident, message["type"])
+                if message.get("type") == "error":
+                    # Do not persist provider descriptions, which may echo speech or tokens.
+                    app.state.store.audit("voice_provider_error", f"incident={ident}; check Twilio ConversationRelay diagnostics")
                 if message.get("type") in ("interrupt", "prompt"):
                     if task:
                         task.cancel()
@@ -279,6 +294,7 @@ async def voice(ws: WebSocket, ident: int):
     except (WebSocketDisconnect, TimeoutError):
         pass
     finally:
+        log.info("Guardian voice disconnected incident=%s", ident)
         if task:
             task.cancel()
             with suppress(asyncio.CancelledError):
