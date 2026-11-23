@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reno Guardian</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#f4f6f8;color:#182d3b;max-width:960px;margin:40px auto;padding:0 24px}
+header{border-bottom:1px solid #ccd6df;padding-bottom:22px}h1{font-size:28px}
+input,button{font:inherit;padding:10px;border:1px solid #9cabb8;border-radius:5px}
+button{background:#145968;color:white;cursor:pointer}button:disabled{opacity:.5;cursor:wait}
+input{width:350px;max-width:80%;margin-right:12px}article{background:white;padding:20px;margin:20px 0;border:1px solid #d7dfe5}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.6}
+small{display:block;color:#526577;margin-bottom:12px}#status{min-height:24px}
+</style>
+<header><h1>Reno Guardian</h1><p>Review incidents, investigate evidence, and approve a proposed response.</p>
+<form id="login"><label for="token">Administrator token</label><p><input id="token" type="password" autocomplete="off" required><button>Connect</button></p></form>
+<p>The token stays in memory for this page. Proposal approval is recorded here. Deployment integration is pending.</p></header>
+<p id="status" role="status"></p><main id="content"></main>
+<script src="/review.js" defer></script>
+</html>

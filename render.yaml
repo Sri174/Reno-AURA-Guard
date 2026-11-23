@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: reno-aura-guard
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r reno_guardian/requirements.txt
+    startCommand: uvicorn reno_guardian.app:app --host 0.0.0.0 --port $PORT --workers 1 --no-access-log
+    healthCheckPath: /health
+    disk:
+      name: guardian-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: GUARDIAN_ADMIN_TOKEN
+        generateValue: true
+      - key: GUARDIAN_STATE_PATH
+        value: /var/data/guardian/incidents.sqlite3
+      - key: GUARDIAN_CALLS_ENABLED
+        value: "false"
+      - key: GUARDIAN_TAMIL_VOICE
+        value: ta-IN-Chirp3-HD-Aoede
