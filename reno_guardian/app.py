@@ -269,12 +269,24 @@ async def voice(ws: WebSocket, ident: int):
         trace("prompt", chars=len(question))
         log.info("Guardian voice final prompt incident=%s chars=%s", ident, len(question))
         history.append({"role": "user", "content": redact(question)[:2000]})
+        answer_task = asyncio.create_task(answer(incident, history))
         try:
-            reply = await answer(incident, history)
-        except (httpx.HTTPError, KeyError, ValueError, TypeError, IndexError) as exc:
+            try:
+                reply = await asyncio.wait_for(asyncio.shield(answer_task), timeout=2.5)
+            except TimeoutError:
+                await ws.send_json({"type": "text", "token": "ஒரு நிமிஷம், பதில் வர கொஞ்சம் நேரம் ஆகுது.",
+                                    "last": True, "interruptible": True, "preemptible": True})
+                trace("waiting_notice")
+                reply = await asyncio.wait_for(answer_task, timeout=9.5)
+        except (httpx.HTTPError, KeyError, ValueError, TypeError, IndexError, TimeoutError) as exc:
             trace("ai_error", error_type=type(exc).__name__)
             log.warning("Guardian voice AI failed incident=%s error_type=%s", ident, type(exc).__name__)
             reply = "சாரி, இப்போ AI service-ல இருந்து பதில் வரல. Dashboard-ல இந்த alert விவரங்களைப் பாருங்க."
+        finally:
+            if not answer_task.done():
+                answer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await answer_task
         await ws.send_json({"type": "text", "token": reply, "last": True, "interruptible": True})
         trace("reply_sent", chars=len(reply), elapsed_ms=round((time.monotonic()-started)*1000))
         log.info("Guardian voice reply sent incident=%s elapsed_ms=%s", ident, round((time.monotonic()-started)*1000))

@@ -172,6 +172,24 @@ class GuardianTests(unittest.TestCase):
                 self.assertIn("voice_reply_sent", [e["event"] for e in response.json()["events"]])
                 self.assertNotIn("ஹலோ", response.text)
 
+    def test_slow_ai_gets_waiting_notice_then_answer(self):
+        import asyncio
+        async def slow_answer(*args):
+            await asyncio.sleep(2.7)
+            return "சரி, பேசலாம்."
+        settings = {"GUARDIAN_ADMIN_TOKEN": "x"*40, "GUARDIAN_HEALTH_URL": "",
+                    "GUARDIAN_CALLS_ENABLED": "false", "GUARDIAN_STATE_PATH": self.temp.name+"/slow.sqlite3"}
+        with patch.dict(os.environ, settings), patch("reno_guardian.app.answer", side_effect=slow_answer):
+            with TestClient(app) as client:
+                ident = app.state.store.event("slow-test", "Test", "Synthetic", "info")["id"]
+                expires = int(time.time())+300
+                with client.websocket_connect(f"/voice/{ident}?expires={expires}&token={voice_token(ident, expires)}") as socket:
+                    socket.send_json({"type": "prompt", "voicePrompt": "ஹலோ", "last": True})
+                    notice = socket.receive_json()
+                    self.assertTrue(notice["preemptible"])
+                    self.assertIn("நேரம்", notice["token"])
+                    self.assertEqual(socket.receive_json()["token"], "சரி, பேசலாம்.")
+
 
 if __name__ == "__main__":
     unittest.main()
