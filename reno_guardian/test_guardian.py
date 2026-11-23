@@ -145,6 +145,33 @@ class GuardianTests(unittest.TestCase):
         self.assertEqual(relay.attrib["transcriptionLanguage"], "ta-IN")
         self.assertEqual(relay.attrib["speechTimeout"], "1200")
 
+    def test_empty_speech_and_late_interrupt_do_not_cancel_reply(self):
+        import asyncio
+        import threading
+        completed = threading.Event()
+        async def slow_answer(*args):
+            await asyncio.sleep(0.15)
+            completed.set()
+            return "கேக்குது, சொல்லுங்க."
+        settings = {"GUARDIAN_ADMIN_TOKEN": "x"*40, "GUARDIAN_HEALTH_URL": "",
+                    "GUARDIAN_CALLS_ENABLED": "false", "GUARDIAN_STATE_PATH": self.temp.name+"/empty.sqlite3"}
+        with patch.dict(os.environ, settings), patch("reno_guardian.app.answer", side_effect=slow_answer):
+            with TestClient(app) as client:
+                incident = app.state.store.event("voice-test", "Test", "Synthetic test", "info")
+                ident = incident['id']
+                expires = int(time.time())+300
+                with client.websocket_connect(f"/voice/{ident}?expires={expires}&token={voice_token(ident, expires)}") as socket:
+                    socket.send_json({"type": "prompt", "voicePrompt": "ஹலோ", "last": True})
+                    socket.send_json({"type": "prompt", "voicePrompt": "", "last": True})
+                    socket.send_json({"type": "interrupt", "utteranceUntilInterrupt": ""})
+                    self.assertTrue(completed.wait(3), "Empty speech cancelled the AI reply")
+                    self.assertEqual(socket.receive_json()["token"], "கேக்குது, சொல்லுங்க.")
+                self.assertEqual(client.get(f"/voice-status/{ident}").status_code, 401)
+                response = client.get(f"/voice-status/{ident}", headers={"Authorization": "Bearer "+"x"*40})
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("voice_reply_sent", [e["event"] for e in response.json()["events"]])
+                self.assertNotIn("ஹலோ", response.text)
+
 
 if __name__ == "__main__":
     unittest.main()

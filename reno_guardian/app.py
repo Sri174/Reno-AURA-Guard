@@ -177,6 +177,22 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/voice-status/{ident}", dependencies=[Depends(authenticate)])
+def voice_status(ident: int):
+    """Operational metadata only: never speech, credentials or capability URLs."""
+    events = []
+    with app.state.store.connect() as db:
+        rows = db.execute("SELECT at, action, detail FROM audit WHERE action LIKE 'voice_%' ORDER BY id DESC LIMIT 500").fetchall()
+    for row in rows:
+        try:
+            detail = json.loads(row["detail"])
+        except (ValueError, TypeError):
+            continue
+        if detail.get("incident") == ident:
+            events.append({"at": row["at"], "event": row["action"], **detail})
+    return {"revision": os.environ.get("RENDER_GIT_COMMIT", "local"), "events": events[:100]}
+
+
 @app.get("/incidents", dependencies=[Depends(authenticate)])
 def incidents():
     return app.state.store.incidents()
@@ -239,6 +255,10 @@ async def voice(ws: WebSocket, ident: int):
         return
     app.state.used_voice.add(token)
     await ws.accept()
+    session = secrets.token_hex(8)
+    def trace(event, **metadata):
+        app.state.store.audit("voice_"+event, json.dumps({"incident": ident, "session": session, **metadata}))
+    trace("connected")
     log.info("Guardian voice connected incident=%s", ident)
     history = []
     task = None
@@ -246,14 +266,17 @@ async def voice(ws: WebSocket, ident: int):
 
     async def respond(question):
         started = time.monotonic()
+        trace("prompt", chars=len(question))
         log.info("Guardian voice final prompt incident=%s chars=%s", ident, len(question))
         history.append({"role": "user", "content": redact(question)[:2000]})
         try:
             reply = await answer(incident, history)
         except (httpx.HTTPError, KeyError, ValueError, TypeError, IndexError) as exc:
+            trace("ai_error", error_type=type(exc).__name__)
             log.warning("Guardian voice AI failed incident=%s error_type=%s", ident, type(exc).__name__)
             reply = "சாரி, இப்போ AI service-ல இருந்து பதில் வரல. Dashboard-ல இந்த alert விவரங்களைப் பாருங்க."
         await ws.send_json({"type": "text", "token": reply, "last": True, "interruptible": True})
+        trace("reply_sent", chars=len(reply), elapsed_ms=round((time.monotonic()-started)*1000))
         log.info("Guardian voice reply sent incident=%s elapsed_ms=%s", ident, round((time.monotonic()-started)*1000))
         history.append({"role": "assistant", "content": reply})
         del history[:-12]
@@ -262,12 +285,23 @@ async def voice(ws: WebSocket, ident: int):
         async with asyncio.timeout(300):
             async for message in ws.iter_json():
                 if message.get("type") in ("setup", "error", "interrupt"):
+                    trace(message["type"])
                     log.info("Guardian voice event incident=%s type=%s", ident, message["type"])
                 if message.get("type") == "error":
                     # Do not persist provider descriptions, which may echo speech or tokens.
                     app.state.store.audit("voice_provider_error", f"incident={ident}; check Twilio ConversationRelay diagnostics")
-                if message.get("type") in ("interrupt", "prompt"):
+                fragment = message.get("voicePrompt", "")
+                has_speech = isinstance(fragment, str) and bool(fragment.strip())
+                if message.get("type") == "prompt":
+                    trace("speech_event", chars=len(fragment) if isinstance(fragment, str) else 0,
+                          final=message.get("last") is True)
+                # Empty STT updates must not cancel a response already in flight.
+                # A delayed interrupt describes previous TTS playback; new caller
+                # speech (the prompt) is what supersedes a pending AI response.
+                if message.get("type") == "prompt" and has_speech:
                     if task:
+                        if not task.done():
+                            trace("reply_cancelled")
                         task.cancel()
                         with suppress(asyncio.CancelledError):
                             await task
@@ -280,10 +314,8 @@ async def voice(ws: WebSocket, ident: int):
                         heard = redact(message.get("utteranceUntilInterrupt", ""))[:2000]
                         if heard:
                             history.append({"role": "assistant", "content": heard})
-                    pending_speech.clear()
                 if message.get("type") == "prompt":
-                    fragment = message.get("voicePrompt", "")
-                    if isinstance(fragment, str) and fragment.strip():
+                    if has_speech:
                         pending_speech.append(fragment.strip())
                         pending_speech[:] = [" ".join(pending_speech)[-2000:]]
                 if message.get("type") == "prompt" and message.get("last"):
@@ -294,6 +326,7 @@ async def voice(ws: WebSocket, ident: int):
     except (WebSocketDisconnect, TimeoutError):
         pass
     finally:
+        trace("disconnected")
         log.info("Guardian voice disconnected incident=%s", ident)
         if task:
             task.cancel()
