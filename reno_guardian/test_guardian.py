@@ -10,6 +10,34 @@ from .core import Store, redact
 
 
 class GuardianTests(unittest.TestCase):
+    def test_stream_speaks_complete_sentences_before_completion(self):
+        import asyncio
+        import json
+        from .app import stream_sentences
+        spoken = []
+        class Response:
+            async def aiter_lines(self):
+                yield 'data: '+json.dumps({'choices': [{'delta': {'content': 'முதல் பதில். '}}]})
+                self_test.assertEqual(spoken, ['முதல் பதில். '])
+                yield 'data: '+json.dumps({'choices': [{'delta': {'content': 'அடுத்த பதில்.'}, 'finish_reason': 'stop'}]})
+                yield 'data: [DONE]'
+        self_test = self
+        async def send(text): spoken.append(text)
+        result = asyncio.run(stream_sentences(Response(), send))
+        self.assertEqual(result, 'முதல் பதில். அடுத்த பதில்.')
+
+    def test_truncated_stream_does_not_speak_incomplete_tail(self):
+        import asyncio
+        import json
+        from .app import stream_sentences
+        send = AsyncMock()
+        class Response:
+            async def aiter_lines(self):
+                yield 'data: '+json.dumps({'choices': [{'delta': {'content': 'உங்களால்'}, 'finish_reason': 'length'}]})
+        with self.assertRaises(ValueError):
+            asyncio.run(stream_sentences(Response(), send))
+        send.assert_not_awaited()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = Store(self.temp.name+"/test.sqlite3")
@@ -150,7 +178,7 @@ class GuardianTests(unittest.TestCase):
         import asyncio
         import threading
         completed = threading.Event()
-        async def slow_answer(*args):
+        async def slow_answer(*args, **kwargs):
             await asyncio.sleep(0.15)
             completed.set()
             return "கேக்குது, சொல்லுங்க."
@@ -173,9 +201,9 @@ class GuardianTests(unittest.TestCase):
                 self.assertIn("voice_reply_sent", [e["event"] for e in response.json()["events"]])
                 self.assertNotIn("ஹலோ", response.text)
 
-    def test_slow_ai_gets_waiting_notice_then_answer(self):
+    def test_slow_ai_does_not_repeat_waiting_announcements(self):
         import asyncio
-        async def slow_answer(*args):
+        async def slow_answer(*args, **kwargs):
             await asyncio.sleep(2.7)
             return "சரி, பேசலாம்."
         settings = {"GUARDIAN_ADMIN_TOKEN": "x"*40, "GUARDIAN_HEALTH_URL": "",
@@ -186,9 +214,6 @@ class GuardianTests(unittest.TestCase):
                 expires = int(time.time())+300
                 with client.websocket_connect(f"/voice/{ident}?expires={expires}&token={voice_token(ident, expires)}") as socket:
                     socket.send_json({"type": "prompt", "voicePrompt": "ஹலோ", "last": True})
-                    notice = socket.receive_json()
-                    self.assertTrue(notice["preemptible"])
-                    self.assertIn("நேரம்", notice["token"])
                     self.assertEqual(socket.receive_json()["token"], "சரி, பேசலாம்.")
 
     def test_keypad_checks_reply_path_without_ai(self):

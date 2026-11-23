@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -35,7 +36,41 @@ def voice_token(ident, expires):
     return hmac.new(env("ADMIN_TOKEN").encode(), f"{ident}:{expires}".encode(), hashlib.sha256).hexdigest()
 
 
-async def answer(incident, history, investigation=False):
+async def stream_sentences(response, on_text):
+    """Send complete, redacted sentences early; never speak a truncated tail."""
+    pending = ""
+    spoken = []
+    finish = None
+    async for line in response.aiter_lines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        item = json.loads(data)
+        choices = item.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        finish = choice.get("finish_reason") or finish
+        pending += choice.get("delta", {}).get("content") or ""
+        while match := re.search(r"[.!?](?:\s|$)", pending):
+            sentence, pending = pending[:match.end()], pending[match.end():]
+            sentence = redact(sentence)
+            await on_text(sentence)
+            spoken.append(sentence)
+    if finish != "stop":
+        raise ValueError("Voice completion did not finish normally")
+    if pending.strip():
+        sentence = redact(pending)
+        await on_text(sentence)
+        spoken.append(sentence)
+    if not spoken:
+        raise ValueError("Empty voice completion")
+    return "".join(spoken)
+
+
+async def answer(incident, history, investigation=False, on_text=None):
     endpoint = env("LLM_URL")
     if not endpoint or not env("LLM_MODEL"):
         return ("AI analysis is not configured. Review the incident evidence before proposing a fix."
@@ -64,14 +99,25 @@ async def answer(incident, history, investigation=False):
            "forced fillers and claims to be human. For a test incident, clearly say it is a test and "
            "do not invent an application outage. Introduce yourself as AI if asked.")
     )
+    payload = {"model": env("LLM_MODEL"), "max_tokens": 1600 if investigation else 1024,
+               "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": "Incident evidence\n"+redact(json.dumps(incident))},
+                            *history[-12:]]}
+    if not investigation and env("LLM_MODEL").startswith("gemini-3"):
+        payload["reasoning_effort"] = env("VOICE_REASONING", "low")
     async with httpx.AsyncClient(timeout=25) as client:
-        response = await client.post(endpoint, headers={"Authorization": "Bearer "+env("LLM_KEY")},
-                                     json={"model": env("LLM_MODEL"), "max_tokens": 1600 if investigation else 220,
-                                           "messages": [{"role": "system", "content": system},
-                                                        {"role": "user", "content": "Incident evidence\n"+redact(json.dumps(incident))},
-                                                        *history[-12:]]})
+        headers = {"Authorization": "Bearer "+env("LLM_KEY")}
+        if on_text and not investigation:
+            payload["stream"] = True
+            async with client.stream("POST", endpoint, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                return await stream_sentences(response, on_text)
+        response = await client.post(endpoint, headers=headers, json=payload)
         response.raise_for_status()
-        return redact(response.json()["choices"][0]["message"]["content"])
+        choice = response.json()["choices"][0]
+        if not investigation and choice.get("finish_reason") != "stop":
+            raise ValueError("Voice completion did not finish normally")
+        return redact(choice["message"]["content"])
 
 
 async def call_owner(store, incident):
@@ -95,6 +141,7 @@ async def call_owner(store, incident):
             "reportInputDuringAgentSpeech": "any", "speechTimeout": "1200",
             "transcriptionLanguage": "ta-IN", "ttsLanguage": "ta-IN",
             "dtmfDetection": "true", "events": "speaker-events",
+            "echoPromptFiltering": "true", "interruptSensitivity": "medium", "ignoreBackchannel": "true",
             "welcomeGreeting": "ஹலோ, நான் Reno Guardian, உங்க AI assistant. இப்போ பேசலாமா?"
         })
         async with httpx.AsyncClient(timeout=15) as client:
@@ -270,16 +317,18 @@ async def voice(ws: WebSocket, ident: int):
         trace("prompt", chars=len(question))
         log.info("Guardian voice final prompt incident=%s chars=%s", ident, len(question))
         history.append({"role": "user", "content": redact(question)[:2000]})
-        answer_task = asyncio.create_task(answer(incident, history))
+        chunks = []
+        async def speak(sentence):
+            await ws.send_json({"type": "text", "token": sentence, "last": False, "interruptible": True})
+            if not chunks:
+                trace("first_reply_audio", elapsed_ms=round((time.monotonic()-started)*1000))
+            chunks.append(sentence)
+        answer_task = asyncio.create_task(answer(incident, history, on_text=speak))
+        failed = False
         try:
-            try:
-                reply = await asyncio.wait_for(asyncio.shield(answer_task), timeout=2.5)
-            except TimeoutError:
-                await ws.send_json({"type": "text", "token": "ஒரு நிமிஷம், பதில் வர கொஞ்சம் நேரம் ஆகுது.",
-                                    "last": True, "interruptible": True, "preemptible": True})
-                trace("waiting_notice")
-                reply = await asyncio.wait_for(answer_task, timeout=9.5)
+            reply = await asyncio.wait_for(answer_task, timeout=20)
         except (httpx.HTTPError, KeyError, ValueError, TypeError, IndexError, TimeoutError) as exc:
+            failed = True
             trace("ai_error", error_type=type(exc).__name__)
             log.warning("Guardian voice AI failed incident=%s error_type=%s", ident, type(exc).__name__)
             reply = "சாரி, இப்போ AI service-ல இருந்து பதில் வரல. Dashboard-ல இந்த alert விவரங்களைப் பாருங்க."
@@ -288,10 +337,11 @@ async def voice(ws: WebSocket, ident: int):
                 answer_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await answer_task
-        await ws.send_json({"type": "text", "token": reply, "last": True, "interruptible": True})
+        await ws.send_json({"type": "text", "token": reply if failed or not chunks else "",
+                            "last": True, "interruptible": True})
         trace("reply_sent", chars=len(reply), elapsed_ms=round((time.monotonic()-started)*1000))
         log.info("Guardian voice reply sent incident=%s elapsed_ms=%s", ident, round((time.monotonic()-started)*1000))
-        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "assistant", "content": ("".join(chunks)+reply) if failed else reply})
         del history[:-12]
 
     try:
